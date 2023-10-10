@@ -1,0 +1,80 @@
+FROM jenkins/inbound-agent:4.10-2-alpine AS jnlp
+FROM registry.redhat.io/openshift4/ose-cli:v4.9 AS openshift-cli
+FROM registry.access.redhat.com/ubi8/ubi:8.6
+
+# USER root
+
+# Set timezone
+ENV TZ="Asia/Manila"
+
+LABEL maintainer="Red Hat, Inc."
+
+LABEL com.redhat.component="podman-container"
+LABEL com.redhat.license_terms="https://www.redhat.com/en/about/red-hat-end-user-license-agreements#UBI"
+LABEL name="rhel8/podman"
+LABEL version="8.6"
+
+LABEL License="ASL 2.0"
+
+#labels for container catalog
+LABEL summary="Manage Pods, Containers and Container Images"
+LABEL description="podman (Pod Manager) is a fully featured container engine that is a simple daemonless tool. podman provides a Docker-CLI comparable command line that eases the transition from other container engines and allows the management of pods, containers and images.  Simply put: alias docker=podman.  Most podman commands can be run as a regular user, without requiring additional privileges. podman uses Buildah(1) internally to create container images. Both tools share image (not container) storage, hence each can use or manipulate images (but not containers) created by the other."
+LABEL io.k8s.display-name="podman"
+LABEL io.openshift.expose-services=""
+
+# Don't include container-selinux and remove
+# directories used by yum that are just taking
+# up space.
+RUN dnf -y module enable container-tools:rhel8; dnf -y update; rpm --restore --quiet shadow-utils; \
+dnf -y install crun podman fuse-overlayfs /etc/containers/storage.conf --exclude container-selinux; \
+rm -rf /var/cache /var/log/dnf* /var/log/yum.*
+
+RUN useradd -u 1000 jenkins; \
+echo jenkins:100000:65536 > /etc/subuid; \
+echo jenkins:100000:65536 > /etc/subgid; \
+cho 1000:100000:65536 > /etc/subuid; \
+echo 1000:100000:65536 > /etc/subgid;
+
+
+VOLUME /var/lib/containers
+RUN mkdir -p /home/jenkins/.local/share/containers
+RUN chown jenkins:jenkins -R /home/jenkins
+VOLUME /home/jenkins/.local/share/containers
+
+# chmod containers.conf and adjust storage.conf to enable Fuse storage.
+RUN chmod 644 /etc/containers/containers.conf; sed -i -e 's|^#mount_program|mount_program|g' -e '/additionalimage.*/a "/var/lib/shared",' -e 's|^mountopt[[:space:]]*=.*$|mountopt = "nodev,fsync=0"|g' /etc/containers/storage.conf
+RUN mkdir -p /var/lib/shared/overlay-images /var/lib/shared/overlay-layers /var/lib/shared/vfs-images /var/lib/shared/vfs-layers; touch /var/lib/shared/overlay-images/images.lock; touch /var/lib/shared/overlay-layers/layers.lock; touch /var/lib/shared/vfs-images/images.lock; touch /var/lib/shared/vfs-layers/layers.lock
+
+ENV _CONTAINERS_USERNS_CONFIGURED=""
+
+# Install packages
+RUN INSTALL_PKGS="bc gettext git java-11-openjdk-headless java-1.8.0-openjdk-headless lsof rsync tar unzip which zip bzip2 jq tzdata wget sshpass mailx postfix" && \
+    yum install -y --setopt=tsflags=nodocs --disableplugin=subscription-manager $INSTALL_PKGS && \
+    rpm -V  $INSTALL_PKGS && \
+    yum clean all
+
+# Copy jnlp files
+COPY --from=jnlp /usr/local/bin/jenkins-agent /usr/local/bin/jenkins-agent
+COPY --from=jnlp /usr/share/jenkins/agent.jar /usr/share/jenkins/agent.jar
+
+# Copy openshift cli
+COPY --from=openshift-cli /usr/bin/oc /usr/bin/oc
+
+# Add Certificates
+COPY build-mount/certificates/system/* /usr/share/pki/ca-trust-source/anchors/
+
+# Trust Certificates
+RUN update-ca-trust
+
+#mailx postdrop public pickup
+RUN mkfifo /var/spool/postfix/public/pickup
+
+# Volume for jenkins local containers
+VOLUME /home/jenkins/.jenkins
+VOLUME /home/jenkins/agent
+
+USER jenkins
+WORKDIR /home/jenkins
+
+# Run the Jenkins agent
+ENTRYPOINT ["/usr/local/bin/jenkins-agent"]
